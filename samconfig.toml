@@ -1,0 +1,13 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "health-events-analyzer-v3"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-EXAMPLE"
+s3_prefix = "health-events-analyzer-v3"
+region = "ap-southeast-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+parameter_overrides = "AnalysisWindowDays=\"7\" SenderEmail=\"mannylee+healtheventsanalyser@amazon.com\" RecipientEmails=\"mannylee+healtheventsanalyser@amazon.com\" EventCategories=\"accountNotification,scheduledChange\" ExcludedServices=\"\" ExcelFilenameTemplate=\"AWS_Health_Events_Analysis_{date}_{time}.xlsx\" ScheduleEnabled=\"true\" CustomerName=\"\" AccountSpecificEmailCC=\"mannylee+cc@amazon.com\" BedrockTopP=\"0.9\" S3BucketName=\"\" S3KeyPrefix=\"\" UseOrganizationAccountEmailMapping=\"true\" OverrideS3HealthEventsArn=\"\" UseCustomAccountEmailMapping=\"true\""
+image_repositories = []

@@ -1,0 +1,755 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'AWS Health Events Analysis Solution with Microservices Architecture - Step Functions, SQS, and specialized Lambda functions'
+
+Parameters:
+  AnalysisWindowDays:
+    Type: Number
+    Default: 8
+    Description: Number of days of historical events to analyze
+    MinValue: 1
+    MaxValue: 365
+  
+  SenderEmail:
+    Type: String
+    Description: Email address to send reports from (must be verified in SES)
+    
+  RecipientEmails:
+    Type: String
+    Description: Comma-separated list of email addresses to receive reports
+    
+  EventCategories:
+    Type: String
+    Description: (Optional) Comma-separated list of event categories to filter
+    Default: 'accountNotification'
+    
+  ExcludedServices:
+    Type: String
+    Description: (Optional) Comma-separated list of services to exclude from analysis
+    Default: ''
+    
+  ExcelFilenameTemplate:
+    Type: String
+    Description: Template for Excel filenames (use {date} and {time} as placeholders)
+    Default: 'AWS_Health_Events_Analysis_{date}_{time}.xlsx'
+    
+  ScheduleEnabled:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Enable or disable the scheduled execution
+    
+  CustomerName:
+    Type: String
+    Description: (Optional) Customer name for report customization
+    Default: ''
+    
+  AccountSpecificEmailCC:
+    Type: String
+    Description: (Optional) Email address to CC on all account-specific reports (leave empty to disable)
+    Default: ''
+    
+  BedrockTopP:
+    Type: Number
+    Default: 0.9
+    Description: Top-p parameter for Bedrock model (0.0-1.0)
+    MinValue: 0.0
+    MaxValue: 1.0
+    
+  # S3 bucket name parameter with empty default
+  S3BucketName:
+    Type: String
+    Description: (Optional) Name of the S3 bucket to store health events analysis
+    Default: ''
+    
+  # S3 key prefix parameter with empty default
+  S3KeyPrefix:
+    Type: String
+    Description: (Optional) Prefix for S3 objects in the bucket
+    Default: ''
+    
+  # Organization account email mapping parameter
+  UseOrganizationAccountEmailMapping:
+    Type: String
+    Description: Enable account-specific email routing using AWS Organizations account email addresses (true/false)
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    
+  # S3 health events override parameter (for testing only)
+  OverrideS3HealthEventsArn:
+    Type: String
+    Description: '(Optional) Health events analyser will analyse a file on S3 instead of using the Health API'
+    Default: ''
+    
+  # Custom account email mapping table
+  UseCustomAccountEmailMapping:
+    Type: String
+    Description: 'Enable custom account-email mapping using DynamoDB table (true/false). When enabled, creates a DynamoDB table for managing account-to-email mappings.'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Resources:
+  # SQS Queues for microservices communication
+  BedrockAnalysisQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-bedrock-analysis-queue'
+      VisibilityTimeout: 900  # 15 minutes
+      MessageRetentionPeriod: 1209600  # 14 days
+      ReceiveMessageWaitTimeSeconds: 20  # Long polling
+      # No DLQ - failed messages will be handled with placeholder analysis
+
+  EmailNotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-email-queue.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 300  # 5 minutes
+      MessageRetentionPeriod: 1209600  # 14 days
+      ReceiveMessageWaitTimeSeconds: 20  # Long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EmailDLQ.Arn
+        maxReceiveCount: 3
+
+
+
+  EmailDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-email-dlq.fifo'
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # DynamoDB Tables for workflow management
+  WorkflowResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-workflow-results'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: workflow_id
+          AttributeType: S
+        - AttributeName: account_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: workflow_id
+          KeyType: HASH
+        - AttributeName: account_id
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: auto-delete
+          Value: "no"
+
+  BedrockRateLimiterTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-bedrock-rate-limiter'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: limiter_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: limiter_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: auto-delete
+          Value: "no"
+
+  # Layer for Python dependencies
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-dependencies'
+      Description: Dependencies for Health Events Analyzer
+      ContentUri: ./layer
+      CompatibleRuntimes:
+        - python3.11
+      RetentionPolicy: Retain
+    Metadata:
+      BuildMethod: python3.11
+      BuildArchitecture: x86_64
+      RequirementsPath: requirements.txt
+
+  # IAM Role for Lambda execution with microservices permissions
+  HealthEventsAnalyzerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: HealthEventsAnalyzerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Core permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - bedrock:InvokeModel
+                  - bedrock-runtime:InvokeModel
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                  - ses:GetIdentityVerificationAttributes
+                  - ses:GetSendQuota
+                  - cloudwatch:PutMetricData
+                  - health:DescribeEvents
+                  - health:DescribeEventDetails
+                  - health:DescribeAffectedEntities
+                  - health:DescribeEventDetailsForOrganization
+                  - health:DescribeAffectedAccountsForOrganization
+                  - health:DescribeEventsForOrganization
+                  - health:DescribeAffectedEntitiesForOrganization
+                Resource: '*'
+              # Organizations permissions
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:DescribeAccount
+                Resource: '*'
+              # SQS permissions for microservices communication
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt BedrockAnalysisQueue.Arn
+                  - !GetAtt EmailNotificationQueue.Arn
+                  - !GetAtt EmailDLQ.Arn
+              # DynamoDB permissions for workflow management
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt WorkflowResultsTable.Arn
+                  - !GetAtt BedrockRateLimiterTable.Arn
+              # DynamoDB permissions for custom account-email mapping
+              - !If
+                - EnableCustomMapping
+                - Effect: Allow
+                  Action:
+                    - dynamodb:Scan
+                    - dynamodb:GetItem
+                    - dynamodb:Query
+                  Resource: !GetAtt AccountEmailMappingTable.Arn
+                - !Ref AWS::NoValue
+              # S3 permissions for temporary file storage (internal bucket)
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:aws:s3:::${ReportsBucket}/*'
+              # S3 permissions for SAM CLI managed bucket (for testing)
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - 'arn:aws:s3:::aws-sam-cli-managed-*'
+                  - 'arn:aws:s3:::aws-sam-cli-managed-*/*'
+              # Conditional S3 permissions for external bucket
+              - !If
+                - HasExternalS3Bucket
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:GetObject
+                    - s3:ListBucket
+                  Resource: 
+                    - !Sub 'arn:aws:s3:::${S3BucketName}'
+                    - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+                - !Ref AWS::NoValue
+
+  # IAM Role for Step Functions
+  HealthEventsStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt WorkflowInitializerFunction.Arn
+                  - !GetAtt AccountEventsProcessorFunction.Arn
+                  - !GetAtt EmailQueueManagerFunction.Arn
+                  - !GetAtt WorkflowCleanupFunction.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt BedrockAnalysisQueue.Arn
+
+  # Custom resource to generate a unique timestamp for S3 bucket name
+  TimestampGeneratorV2:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt TimestampGeneratorFunction.Arn
+
+  # Lambda function to generate timestamp for S3 bucket name
+  TimestampGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-timestamp-generator'
+      Description: 'CloudFormation custom resource function that generates unique timestamps for S3 bucket naming'
+      InlineCode: |
+        import cfnresponse
+        import datetime
+        import boto3
+        import os
+        
+        def handler(event, context):
+            if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+            
+            try:
+                # Generate timestamp in format YYYYMMDD-HHMMSS
+                now = datetime.datetime.utcnow()
+                timestamp = now.strftime('%Y%m%d-%H%M%S')
+                
+                response_data = {
+                    'Timestamp': timestamp
+                }
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+            except Exception as e:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Handler: index.handler
+      Runtime: python3.11
+      Timeout: 30
+
+  # S3 Bucket for temporary report storage with dynamic naming and 90-day lifecycle
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: TimestampGeneratorV2
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-health-reports-${TimestampGeneratorV2.Timestamp}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: 90
+      # Add server-side encryption
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Step Functions State Machine for workflow orchestration
+  HealthEventsWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-health-events-workflow'
+      RoleArn: !GetAtt HealthEventsStepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Health Events Analysis Microservices Workflow",
+          "StartAt": "InitializeWorkflow",
+          "States": {
+            "InitializeWorkflow": {
+              "Type": "Task",
+              "Resource": "${WorkflowInitializerFunction.Arn}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Next": "ProcessAccountsInParallel"
+            },
+            "ProcessAccountsInParallel": {
+              "Type": "Map",
+              "ItemsPath": "$.accounts",
+              "MaxConcurrency": 5,
+              "ResultPath": "$.map_results",
+              "Parameters": {
+                "account_data.$": "$$.Map.Item.Value",
+                "total_accounts.$": "$.total_accounts"
+              },
+              "Iterator": {
+                "StartAt": "ProcessAccountEvents",
+                "States": {
+                  "ProcessAccountEvents": {
+                    "Type": "Task",
+                    "Resource": "${AccountEventsProcessorFunction.Arn}",
+                    "Parameters": {
+                      "workflow_id.$": "$.account_data.workflow_id",
+                      "account_id.$": "$.account_data.account_id",
+                      "events.$": "$.account_data.events",
+                      "email_mapping.$": "$.account_data.email_mapping",
+                      "mapping_source.$": "$.account_data.mapping_source",
+                      "event_count.$": "$.account_data.event_count",
+                      "total_accounts.$": "$.total_accounts"
+                    },
+                    "Next": "QueueForBedrockAnalysis"
+                  },
+                  "QueueForBedrockAnalysis": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::sqs:sendMessage",
+                    "Parameters": {
+                      "QueueUrl": "${BedrockAnalysisQueue}",
+                      "MessageBody.$": "$"
+                    },
+                    "End": true
+                  }
+                }
+              },
+              "Next": "CheckCompletionAndQueueEmails"
+            },
+            "CheckCompletionAndQueueEmails": {
+              "Type": "Task",
+              "Resource": "${EmailQueueManagerFunction.Arn}",
+              "Parameters": {
+                "workflow_id.$": "$.workflow_id",
+                "total_accounts.$": "$.total_accounts",
+                "fallback_mode": true
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["IncompleteWorkflowException"],
+                  "IntervalSeconds": 60,
+                  "MaxAttempts": 5,
+                  "BackoffRate": 1.5
+                }
+              ],
+              "Next": "CleanupWorkflow"
+            },
+            "CleanupWorkflow": {
+              "Type": "Task",
+              "Resource": "${WorkflowCleanupFunction.Arn}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+
+  # Microservices Lambda Functions
+  WorkflowInitializerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-workflow-initializer'
+      Description: 'Initializes health events analysis workflow with Step Functions and compatibility support'
+      Handler: workflow_initializer.lambda_handler
+      Role: !GetAtt HealthEventsAnalyzerRole.Arn
+      Runtime: python3.11
+      CodeUri: ./src/
+      MemorySize: 1024
+      Timeout: 300  # 5 minutes
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          ANALYSIS_WINDOW_DAYS: !Ref AnalysisWindowDays
+          EVENT_CATEGORIES: !Ref EventCategories
+          EXCLUDED_SERVICES: !Ref ExcludedServices
+          USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING: !Ref UseOrganizationAccountEmailMapping
+          USE_CUSTOM_ACCOUNT_EMAIL_MAPPING: !Ref UseCustomAccountEmailMapping
+          ACCOUNT_EMAIL_MAPPING_TABLE: !If [EnableCustomMapping, !Ref AccountEmailMappingTable, '']
+          OVERRIDE_S3_HEALTH_EVENTS_ARN: !Ref OverrideS3HealthEventsArn
+          WORKFLOW_RESULTS_TABLE: !Ref WorkflowResultsTable
+
+  AccountEventsProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-events-processor'
+      Description: 'Processes health events for individual AWS accounts, filtering and preparing them for analysis'
+      Handler: account_events_processor.lambda_handler
+      Role: !GetAtt HealthEventsAnalyzerRole.Arn
+      Runtime: python3.11
+      CodeUri: ./src/
+      MemorySize: 512
+      Timeout: 180  # 3 minutes
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          EXCLUDED_SERVICES: !Ref ExcludedServices
+
+  BedrockAnalyzerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-bedrock-analyzer'
+      Description: 'Uses Amazon Bedrock AI to analyze health events and generate insights, recommendations, and impact assessments'
+      Handler: bedrock_analyzer.lambda_handler
+      Role: !GetAtt HealthEventsAnalyzerRole.Arn
+      Runtime: python3.11
+      CodeUri: ./src/
+      MemorySize: 1024
+      Timeout: 600  # 10 minutes
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: anthropic.claude-3-5-sonnet-20240620-v1:0
+          BEDROCK_MAX_TOKENS: 4000
+          BEDROCK_TEMPERATURE: 0.3
+          BEDROCK_TOP_P: !Ref BedrockTopP
+          WORKFLOW_RESULTS_TABLE: !Ref WorkflowResultsTable
+          BEDROCK_RATE_LIMITER_TABLE: !Ref BedrockRateLimiterTable
+          EMAIL_QUEUE_MANAGER_FUNCTION_NAME: !Sub '${AWS::StackName}-email-queue-manager'
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt BedrockAnalysisQueue.Arn
+            BatchSize: 1
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  EmailQueueManagerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-email-queue-manager'
+      Description: 'Manages email notification workflow by checking completion status and queuing email tasks'
+      Handler: email_queue_manager.lambda_handler
+      Role: !GetAtt HealthEventsAnalyzerRole.Arn
+      Runtime: python3.11
+      CodeUri: ./src/
+      MemorySize: 512
+      Timeout: 180  # 3 minutes
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          WORKFLOW_RESULTS_TABLE: !Ref WorkflowResultsTable
+          EMAIL_NOTIFICATION_QUEUE_URL: !Ref EmailNotificationQueue
+          RECIPIENT_EMAILS: !Ref RecipientEmails
+
+  WorkflowCleanupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-workflow-cleanup'
+      Description: 'Cleans up workflow data after email notifications are queued'
+      Handler: workflow_cleanup.lambda_handler
+      Role: !GetAtt HealthEventsAnalyzerRole.Arn
+      Runtime: python3.11
+      CodeUri: ./src/
+      MemorySize: 256
+      Timeout: 60  # 1 minute
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          WORKFLOW_RESULTS_TABLE: !Ref WorkflowResultsTable
+
+  EmailSenderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-email-sender'
+      Description: 'Sends health events analysis reports via email with Excel attachments and optional S3 storage'
+      Handler: email_sender.lambda_handler
+      Role: !GetAtt HealthEventsAnalyzerRole.Arn
+      Runtime: python3.11
+      CodeUri: ./src/
+      MemorySize: 1024
+      Timeout: 300  # 5 minutes
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          SENDER_EMAIL: !Ref SenderEmail
+          RECIPIENT_EMAILS: !Ref RecipientEmails
+          EXCEL_FILENAME_TEMPLATE: !Ref ExcelFilenameTemplate
+          REPORTS_BUCKET: !Ref ReportsBucket
+          CUSTOMER_NAME: !Ref CustomerName
+          ACCOUNT_SPECIFIC_EMAIL_CC: !Ref AccountSpecificEmailCC
+          USE_ORGANIZATION_ACCOUNT_EMAIL_MAPPING: !Ref UseOrganizationAccountEmailMapping
+          USE_CUSTOM_ACCOUNT_EMAIL_MAPPING: !Ref UseCustomAccountEmailMapping
+          ACCOUNT_EMAIL_MAPPING_TABLE: !If [EnableCustomMapping, !Ref AccountEmailMappingTable, '']
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EmailNotificationQueue.Arn
+            BatchSize: 1  # Process one email at a time for better control and logging
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+
+
+  # EventBridge Rule for scheduled execution - Run every Tuesday at 5 PM UTC
+  HealthEventsAnalyzerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-health-events-schedule'
+      Description: 'Schedule to trigger AWS Health Events Workflow every Tuesday at 5 PM UTC'
+      ScheduleExpression: 'cron(0 17 ? * TUE *)'
+      State: !If [ScheduleIsEnabled, 'ENABLED', 'DISABLED']
+      Targets:
+        - Id: 'HealthEventsWorkflowTarget'
+          Arn: !Ref HealthEventsWorkflow
+          RoleArn: !GetAtt EventBridgeStepFunctionsRole.Arn
+          Input: '{"source": "aws.events", "detail-type": "Scheduled Event", "resources": ["scheduled-trigger"]}'
+
+  # IAM Role for EventBridge to invoke Step Functions
+  EventBridgeStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeStepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref HealthEventsWorkflow
+
+  # DynamoDB table for custom account-email mapping
+  AccountEmailMappingTable:
+    Type: AWS::DynamoDB::Table
+    Condition: EnableCustomMapping
+    Properties:
+      TableName: !Sub '${AWS::StackName}-account-email-mapping'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: AccountId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AccountId
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Purpose
+          Value: AWS Health Events Account Email Mapping
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: auto-delete
+          Value: "no"
+
+Conditions:
+  ScheduleIsEnabled: !Equals [!Ref ScheduleEnabled, 'true']
+  HasExternalS3Bucket: !Not [!Equals [!Ref S3BucketName, '']]
+  EnableCustomMapping: !Equals [!Ref UseCustomAccountEmailMapping, 'true']
+  HasAccountSpecificEmailCC: !Not [!Equals [!Ref AccountSpecificEmailCC, '']]
+
+Outputs:
+  HealthEventsWorkflowArn:
+    Description: 'ARN of the Step Functions workflow'
+    Value: !Ref HealthEventsWorkflow
+  
+  HealthEventsAnalyzerRoleArn:
+    Description: 'ARN of the Lambda execution IAM role'
+    Value: !GetAtt HealthEventsAnalyzerRole.Arn
+
+  StepFunctionsRoleArn:
+    Description: 'ARN of the Step Functions IAM role'
+    Value: !GetAtt HealthEventsStepFunctionsRole.Arn
+    
+  ReportsBucketName:
+    Description: 'Name of the S3 bucket for report storage'
+    Value: !Ref ReportsBucket
+    
+  ExternalBucketName:
+    Description: 'Name of the external S3 bucket for health events analysis (if provided)'
+    Value: !If [HasExternalS3Bucket, !Ref S3BucketName, 'No external bucket specified']
+    
+  HealthEventsAnalyzerScheduleRuleArn:
+    Description: 'ARN of the EventBridge rule for scheduled execution'
+    Value: !GetAtt HealthEventsAnalyzerScheduleRule.Arn
+
+  BedrockAnalysisQueueUrl:
+    Description: 'URL of the Bedrock analysis SQS queue'
+    Value: !Ref BedrockAnalysisQueue
+
+  EmailNotificationQueueUrl:
+    Description: 'URL of the email notification SQS queue'
+    Value: !Ref EmailNotificationQueue
+
+  WorkflowResultsTableName:
+    Description: 'Name of the DynamoDB table for workflow results'
+    Value: !Ref WorkflowResultsTable
+
+  BedrockRateLimiterTableName:
+    Description: 'Name of the DynamoDB table for Bedrock rate limiting'
+    Value: !Ref BedrockRateLimiterTable
+    
+  BucketTimestamp:
+    Description: 'Timestamp used in bucket name generation'
+    Value: !GetAtt TimestampGeneratorV2.Timestamp
+    
+  AccountEmailMappingTableName:
+    Description: 'Name of the DynamoDB table for account-email mapping (if enabled)'
+    Value: !If [EnableCustomMapping, !Ref AccountEmailMappingTable, 'Custom mapping not enabled']
+    
+  AccountEmailMappingTableArn:
+    Description: 'ARN of the DynamoDB table for account-email mapping (if enabled)'
+    Value: !If [EnableCustomMapping, !GetAtt AccountEmailMappingTable.Arn, 'Custom mapping not enabled']
+    
+  UseCustomAccountEmailMappingStatus:
+    Description: 'Status of custom account-email mapping feature'
+    Value: !Ref UseCustomAccountEmailMapping
+    
+  UseOrganizationAccountEmailMappingStatus:
+    Description: 'Status of AWS Organizations account-email mapping feature'
+    Value: !Ref UseOrganizationAccountEmailMapping
+    
+  AccountSpecificEmailCCStatus:
+    Description: 'CC email address for account-specific reports (if configured)'
+    Value: !If 
+      - HasAccountSpecificEmailCC
+      - !Sub 'Account-specific emails will be CC''d to: ${AccountSpecificEmailCC}'
+      - 'No CC configured for account-specific emails'
