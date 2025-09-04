@@ -654,12 +654,33 @@ def create_analysis_sheet(sheet, analyses):
             risk_level = f"MANUAL REVIEW - {risk_level}"
         sheet.cell(row=row, column=4, value=risk_level)
         
-        # Analysis Status
+        # Analysis Status - Check for different failure types
+        bedrock_failure = analysis_data.get('bedrock_failure', False)
+        failure_reason = analysis_data.get('failure_reason', '')
+        error_type = analysis_data.get('error', '')
+        
         if manual_review:
-            status = "⚠️ PLACEHOLDER - Manual Review Required"
-            cell = sheet.cell(row=row, column=5, value=status)
-            cell.font = Font(color="FF6B35")
-            cell.fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
+            # Determine specific failure type for better messaging
+            if bedrock_failure and ('throttling' in failure_reason.lower() or 'throttling' in error_type.lower()):
+                status = "⏱️ AI TIMEOUT - Bedrock Throttled"
+                cell = sheet.cell(row=row, column=5, value=status)
+                cell.font = Font(color="FF8C00")  # Orange for timeout
+                cell.fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
+            elif bedrock_failure and ('rate limit' in failure_reason.lower() or 'rate limit' in error_type.lower()):
+                status = "⏱️ AI TIMEOUT - Rate Limited"
+                cell = sheet.cell(row=row, column=5, value=status)
+                cell.font = Font(color="FF8C00")  # Orange for timeout
+                cell.fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
+            elif bedrock_failure:
+                status = "❌ AI FAILED - Service Error"
+                cell = sheet.cell(row=row, column=5, value=status)
+                cell.font = Font(color="DC3545")  # Red for failure
+                cell.fill = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
+            else:
+                status = "⚠️ PLACEHOLDER - Manual Review Required"
+                cell = sheet.cell(row=row, column=5, value=status)
+                cell.font = Font(color="FF6B35")
+                cell.fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
         else:
             status = "✅ AI Analysis Complete"
             cell = sheet.cell(row=row, column=5, value=status)
@@ -667,14 +688,34 @@ def create_analysis_sheet(sheet, analyses):
         
         # Full Analysis - JSON response
         if manual_review:
+            # Determine specific analysis status based on failure type
+            bedrock_failure = analysis_data.get('bedrock_failure', False)
+            failure_reason = analysis_data.get('failure_reason', '')
+            error_type = analysis_data.get('error', '')
+            
+            if bedrock_failure and ('throttling' in failure_reason.lower() or 'throttling' in error_type.lower()):
+                analysis_status = 'AI_ANALYSIS_TIMEOUT_THROTTLED'
+                guidance = 'AI analysis timed out due to Bedrock throttling. Please review events manually and consult AWS Health Dashboard'
+            elif bedrock_failure and ('rate limit' in failure_reason.lower() or 'rate limit' in error_type.lower()):
+                analysis_status = 'AI_ANALYSIS_TIMEOUT_RATE_LIMITED'
+                guidance = 'AI analysis timed out due to rate limiting. Please review events manually and consult AWS Health Dashboard'
+            elif bedrock_failure:
+                analysis_status = 'AI_ANALYSIS_FAILED'
+                guidance = 'AI analysis failed due to service error. Please review events manually and consult AWS Health Dashboard'
+            else:
+                analysis_status = 'PLACEHOLDER_ANALYSIS'
+                guidance = 'Please review all events manually and consult AWS Health Dashboard'
+            
             # For placeholder analysis, include the reason and guidance
             full_analysis = {
                 'account_id': account_id,
-                'analysis_status': 'PLACEHOLDER_ANALYSIS',
+                'analysis_status': analysis_status,
                 'manual_review_required': True,
                 'placeholder_reason': analysis_data.get('placeholder_reason', 'AI analysis unavailable'),
                 'failure_reason': analysis_data.get('failure_reason', 'Unknown'),
-                'guidance': 'Please review all events manually and consult AWS Health Dashboard',
+                'bedrock_failure': bedrock_failure,
+                'error_type': error_type,
+                'guidance': guidance,
                 'analysis_data': analysis_data
             }
         else:
@@ -853,11 +894,47 @@ def create_account_specific_html_content(analyses, account_ids):
     """
     
     if manual_review_accounts:
+        # Categorize the manual review accounts by failure type
+        timeout_accounts = []
+        failed_accounts = []
+        other_accounts = []
+        
+        for account in manual_review_accounts:
+            analysis_data = account.get('analysis', {})
+            bedrock_failure = analysis_data.get('bedrock_failure', False)
+            failure_reason = analysis_data.get('failure_reason', '')
+            error_type = analysis_data.get('error', '')
+            
+            if bedrock_failure and ('throttling' in failure_reason.lower() or 'rate limit' in failure_reason.lower() or 'throttling' in error_type.lower()):
+                timeout_accounts.append(account)
+            elif bedrock_failure:
+                failed_accounts.append(account)
+            else:
+                other_accounts.append(account)
+        
         html += f"""
         <div style="background-color: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; margin: 10px 0; border-radius: 5px;">
             <h3 style="color: #856404; margin-top: 0;">⚠️ Manual Review Required</h3>
-            <p style="color: #856404; margin-bottom: 0;">
-                <strong>{len(manual_review_accounts)} account(s)</strong> require manual review because AI analysis was unavailable. 
+            <p style="color: #856404; margin-bottom: 10px;">
+                <strong>{len(manual_review_accounts)} account(s)</strong> require manual review:
+            </p>
+            <ul style="color: #856404; margin: 0; padding-left: 20px;">"""
+        
+        if timeout_accounts:
+            html += f"""
+                <li><strong>{len(timeout_accounts)} account(s)</strong> - AI analysis timed out due to Bedrock throttling/rate limiting</li>"""
+        
+        if failed_accounts:
+            html += f"""
+                <li><strong>{len(failed_accounts)} account(s)</strong> - AI analysis failed due to service errors</li>"""
+        
+        if other_accounts:
+            html += f"""
+                <li><strong>{len(other_accounts)} account(s)</strong> - AI analysis unavailable for other reasons</li>"""
+        
+        html += f"""
+            </ul>
+            <p style="color: #856404; margin-top: 10px; margin-bottom: 0;">
                 Please review the detailed events in the attached Excel report and consult the AWS Health Dashboard.
             </p>
         </div>
@@ -875,7 +952,22 @@ def create_account_specific_html_content(analyses, account_ids):
         event_count = analysis.get('event_count', 0)
         manual_review = analysis_data.get('manual_review_required', False)
         
-        status_indicator = "🔍 MANUAL REVIEW" if manual_review else f"{risk_level} risk"
+        # Determine status indicator based on failure type
+        if manual_review:
+            bedrock_failure = analysis_data.get('bedrock_failure', False)
+            failure_reason = analysis_data.get('failure_reason', '')
+            error_type = analysis_data.get('error', '')
+            
+            if bedrock_failure and ('throttling' in failure_reason.lower() or 'throttling' in error_type.lower()):
+                status_indicator = "⏱️ AI TIMEOUT (Throttled)"
+            elif bedrock_failure and ('rate limit' in failure_reason.lower() or 'rate limit' in error_type.lower()):
+                status_indicator = "⏱️ AI TIMEOUT (Rate Limited)"
+            elif bedrock_failure:
+                status_indicator = "❌ AI FAILED"
+            else:
+                status_indicator = "🔍 MANUAL REVIEW"
+        else:
+            status_indicator = f"{risk_level} risk"
         html += f"<li><strong>Account {account_id}</strong>: {status_indicator}, {event_count} events</li>"
     
     html += """

@@ -593,7 +593,10 @@ def call_bedrock_with_retry(prompt, max_retries=3):
                         'risk_level': 'Medium',
                         'risk_justification': 'Analysis failed due to persistent Bedrock throttling',
                         'summary': 'Unable to complete Bedrock analysis due to throttling after multiple attempts',
-                        'error': 'Bedrock throttling'
+                        'error': 'Bedrock throttling',
+                        'manual_review_required': True,
+                        'bedrock_failure': True,
+                        'failure_reason': 'Persistent Bedrock throttling after multiple retry attempts'
                     }
             else:
                 print(f"Bedrock error: {error_code} - {e.response['Error']['Message']}")
@@ -601,7 +604,10 @@ def call_bedrock_with_retry(prompt, max_retries=3):
                     'risk_level': 'Medium',
                     'risk_justification': f'Analysis failed due to Bedrock error: {error_code}',
                     'summary': f'Unable to complete Bedrock analysis due to {error_code}',
-                    'error': f'Bedrock error: {error_code}'
+                    'error': f'Bedrock error: {error_code}',
+                    'manual_review_required': True,
+                    'bedrock_failure': True,
+                    'failure_reason': f'Bedrock service error: {error_code} - {e.response["Error"]["Message"]}'
                 }
         except Exception as e:
             print(f"Unexpected error calling Bedrock: {str(e)}")
@@ -615,7 +621,10 @@ def call_bedrock_with_retry(prompt, max_retries=3):
                     'risk_level': 'Medium',
                     'risk_justification': f'Analysis failed due to unexpected error: {str(e)}',
                     'summary': 'Unable to complete Bedrock analysis due to unexpected error',
-                    'error': f'Unexpected error: {str(e)}'
+                    'error': f'Unexpected error: {str(e)}',
+                    'manual_review_required': True,
+                    'bedrock_failure': True,
+                    'failure_reason': f'Unexpected error during Bedrock analysis: {str(e)}'
                 }
     
     # If we get here, all retries failed
@@ -623,7 +632,10 @@ def call_bedrock_with_retry(prompt, max_retries=3):
         'risk_level': 'Medium',
         'risk_justification': 'Analysis failed due to repeated Bedrock errors',
         'summary': 'Unable to complete Bedrock analysis after multiple attempts',
-        'error': 'Bedrock analysis failed'
+        'error': 'Bedrock analysis failed',
+        'manual_review_required': True,
+        'bedrock_failure': True,
+        'failure_reason': 'Bedrock analysis failed after multiple retry attempts'
     }
 
 
